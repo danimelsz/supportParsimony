@@ -1,0 +1,1996 @@
+---
+title: "Support and resampling metrics in parsimony analyses"
+author: "Daniel Yudi Miyahara Nakamura"
+date: "2023-09-24"
+output:
+  html_document: 
+    toc: true
+    theme: united
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning=FALSE)
+knitr::knit_hooks$set(crop = knitr::hook_pdfcrop)
+```
+
+# 1. Preamble
+
+Our aim is to test if bootstrap (BS) and jackknife (JK) predict support (Goodman-Bremer, GB) in parsimony analyses. Grant & Kluge (2008) logically explained why BS and JK should not be employed as support, but an empirical evaluation of the relationship between GB and BS or JK has never been done. 
+
+Our statistical analyses are based on the protocol developed by Machado et al. (2022), in which parametric and non-parametric tests are performed with raw and transformed data. We do not conclude anything based only on $P$ values (Nuzzo, 2014), but we also assessed model assumptions (e.g. linearity, normality of residuals and homoscedasticity in linear models), $R^2$ and underestimation and overestimation using machine learning techniques. As such, if BS and JK are good predictors of support (GB), they must vary proportionally. That is, the GB of a clade with BS or JK of 40% is expected to be twice that of a clade with a BS or JK of 80% (Machado et al. 2022).
+
+## 1.1 Libraries
+
+```{r libraries, message=FALSE}
+# Load libraries
+library(canova)
+library(caret)
+library(devtools)
+library(ggfortify)
+library(ggplot2)
+library(gridExtra)
+library(infotheo)
+library(knitr)
+library(lqmm)
+library(MASS)
+library(mgcv)
+library(nlcor)
+detach("package:nlcor") # We detach this package once we stop using it
+library(quantreg)
+detach("package:quantreg") # We detach this package once we stop using it
+library(rcompanion)
+library(reshape2)
+library(scales)
+library(snow)
+library(splines)
+library(tidymv)
+library(tidyverse)
+```
+
+## 1.2 Datasets
+
+```{r}
+# Select working directory
+setwd("~/Downloads/supportParsimony_R")
+
+# Read data
+rawData = read_csv("data.csv")
+rawData = subset(rawData, !grepl("\\?", boot1000)) # remove unshared nodes
+rawData = subset(rawData, !grepl("\\?", jack1000)) # remove unshared nodes
+rawData = rawData[rawData$gb >= 0, ]
+
+# Treat variables as numeric
+rawData$gb = as.numeric(rawData$gb)
+rawData$boot1000 = as.numeric(rawData$boot1000)
+rawData$jack1000 = as.numeric(rawData$jack1000)
+```
+
+# 2. Exploratory data analysis
+In this section, we (1) evaluate the type of distribution of GB, BS and JK, (2) visualize the relationship between GB and BS or JK, and (3) perform exploratory correlation analyses using CANOVA and multiinformation.
+
+## 2.1 Distributions
+```{r, fig.width=12, fig.height=4}
+# Normality tests
+shapiro.test(rawData$gb)
+shapiro.test(rawData$boot1000)
+shapiro.test(rawData$jack1000)
+
+# Visualizing histograms
+plot0 = ggplot(rawData, aes(x = gb)) +
+  geom_histogram(binwidth = 5, fill = "blue", color = "black", alpha = 0.7) +
+  labs(x = "\nGB", y = "Frequency\n")+
+  theme(axis.title.x = element_text(size = 16), axis.title.y = element_text(size = 16))
+plot1 = ggplot(rawData, aes(x = boot1000)) +
+  geom_histogram(binwidth = 5, fill = "red", color = "black", alpha = 0.7) +
+  labs(x = "\nBootstrap", y = "\n")+
+  theme(axis.title.x = element_text(size = 16), axis.title.y = element_text(size = 16))
+plot2 = ggplot(rawData, aes(x = jack1000)) +
+  geom_histogram(binwidth = 5, fill = "darkgreen", color = "black", alpha = 0.7) +
+  labs(x = "\nJackknife", y = "\n")+
+  theme(axis.title.x = element_text(size = 16), axis.title.y = element_text(size = 16))
+grid.arrange(plot0, plot1, plot2, ncol = 3)
+rm(plot0, plot1, plot2)
+
+# BS ~ JK
+plot(rawData$boot1000 ~ rawData$jack1000)
+```
+
+The Shapiro-wilk tests and histograms above revealed that all metrics are not normally distributed. Furthermore, GB exhibits a right-skewed distribution, whereas bootstrap and jackknife present left-skewed distributions. As such, we have some options to test the correlation between GB and bootstrap/jackknife: 
+
+- 1. Perform parametric tests using transformed data (to fit normal distribution, homoscedasticity, and other requirements of parametric tests);
+
+- 2. Perform non-parametric tests (either using raw data or transformed data).
+
+- 3. Perform nonlinear correlations
+
+## 2.2 Visualizing GB ~ BS and JK
+```{r,fig.width=12, fig.height=4}
+# Visualizing the raw data relationship
+plot1 = ggplot(rawData, aes(x = boot1000, y = gb)) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(x = "\nBootstrap", y = "Goodman-Bremer\n")
+plot2 = ggplot(rawData, aes(x = jack1000, y = gb)) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(x = "\nJackknife", y = "Goodman-Bremer\n")
+grid.arrange(plot1, plot2, ncol = 2)
+```
+
+Based on the visualization plot above, the relationships between support (GB) and resampling metrics (bootstrap and jackknife) do not seem linear. Visually, neither bootstrap nor jackknife seem good predictors of GB, but this must be better assessed with statistical tests.
+
+## 2.3 CANOVA
+
+While ANOVA typically is used for categorical predictor variables, CANOVA tests the nonlinear relationship between two continuous variables, namely X and Y. First, CANOVA defines a neighborhood for each data point of X values (Wang et al. 2015). Second, it calculates the variance of Y values within that neighborhood. Third, it performs permutations to test significance of the observed values within the neighborhood variance. Below we test CANOVA using different values of bin size, following Machado et al. (2022).
+
+```{r}
+# Values of tie_shuffle
+tie = c(2, 5, 10, 20, 100, 198, 200)
+
+# CANOVA for GB and bootstrap
+results_gbBoot = vector("list", length(tie))
+for (i in 1:length(tie)) {
+  tie_shuffle = tie[i]
+  canova_gbBoot = canova(rawData$boot10, rawData$gb, perm = 1000, tie_shuffle = tie_shuffle, clusters = 8)
+  results_gbBoot[[i]] = canova_gbBoot
+}
+for (i in 1:length(tie)) {
+  cat("Tie Shuffle =", tie[i], "\n")
+  print(results_gbBoot[[i]])
+  cat("\n")
+}
+
+# CANOVA for GB and jackknife
+results_gbJack = vector("list", length(tie))
+for (i in 1:length(tie)) {
+  tie_shuffle = tie[i]
+  canova_gbJack = canova(rawData$jack10, rawData$gb, perm = 1000, tie_shuffle = tie_shuffle, clusters = 8)
+  results_gbJack[[i]] = canova_gbJack
+}
+for (i in 1:length(tie)) {
+  cat("Tie Shuffle =", tie[i], "\n")
+  print(results_gbJack[[i]])
+  cat("\n")
+}
+```
+
+CANOVA tests indicated that there may be a relationship between support and resampling metrics (p < 0.05). However, CANOVA is not adequate to test if BS or JK are good predictors of GB, because it is not enough for resampling metrics to be correlated with support, but it is also required that these values are porportional to each other (Machado et al. 2022). Thus, we consider it as part of exploratory data analysis.
+
+## 2.4 Multiinformation computation
+Total correlation from the R-package infotheo computes the mutual information among the random variables. Multiinformation output is a matrix with values of total correlation in nats (units of information) using the entropy estimator (Meyer 2008).
+
+```{r}
+set.seed(1)
+
+# Potentially correlated variables
+x1 = rawData$gb
+y1 = rawData$boot1000
+z1 = rawData$jack1000
+# Random variables based on the size, mean, and std of x, y, and z
+x2 = rnorm(length(x1), mean = mean(x1), sd = sd(x1))
+y2 = rnorm(length(y1), mean = mean(y1), sd = sd(y1))
+z2 = rnorm(length(z1), mean = mean(z1), sd = sd(z1))
+# List
+raw_dat = list(x1,y1,z1,x2,y2,z2)
+
+# Discretize for mutual information
+dat = matrix(unlist(raw_dat), ncol=length(raw_dat))
+dat = discretize(dat)
+# Perform total correlation test
+mutinformation(dat)
+# Clean up
+rm(x1, y1, z1, x2, y2, z2, dat, raw_dat)
+```
+
+# 3. Parametric tests
+In this section, we (1) transformed data using logit, natural logarithm, square root, square, and Box Cox, (2) performed multiple Ordinary Least Squares (OLS) analyses, and (3) diagnose if assumptions of linear models were met are using six different properties.
+
+## 3.1 Transformations (THERE IS REP MORE THAN 100????)
+We transformed predictor (BS and JK) and response (GB) variables. We used the following transformations: 
+
+1. Logit of BS or JK
+2. Natural logarithm of BS or JK
+3. Square root of BS or JK
+4. Quadratic transformation of BS or JK
+5. Normalization of GB
+
+The functions below were written by Machado et al. (2022).
+
+```{r,fig.width=12, fig.height=4}
+# Logit of BS
+logit <- function (x) { log10(x / (1 - x)) }
+
+# Normalization of GB
+shat <- function (x, c) { 1 - exp(-x/(10^c))  }
+
+# Define the powerTransform function (for Box Cox transformations)
+powerTransform <- function(y, lambda1, lambda2 = NULL, method = "boxcox") {
+  boxcoxTrans <- function(x, lam1, lam2 = NULL) {
+    # if we set lambda2 to zero, it becomes the one parameter transformation
+    lam2 <- ifelse(is.null(lam2), 0, lam2)
+    if (lam1 == 0L) {
+      log(y + lam2)
+    } else {
+      (((y + lam2)^lam1) - 1) / lam1
+    }
+  }
+  switch(method,
+    boxcox = boxcoxTrans(y, lambda1, lambda2),
+    tukey = y^lambda1
+  )
+}
+
+# Logit of BS and JK
+logitData = rawData[rawData$boot1000>0.0,]
+logitData = logitData[logitData$boot1000<100.0,]
+logitData = logitData[logitData$jack1000<100.0,]
+logitData$BSlogit = logit(logitData$boot1000/100.0)
+logitData$JKlogit = logit(logitData$jack1000/100.0)
+plot1 = ggplot(logitData, aes(x = BSlogit, y = boot1000)) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(x = "\nLogit of BS/100", y = "BS\n") 
+plot2 = ggplot(logitData, aes(x = JKlogit, y = jack1000)) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(x = "\nLogit of JK/100", y = "JK\n")
+grid.arrange(plot1, plot2, ncol = 2)
+
+# Natural logarithm of BS and JK
+plot1 = ggplot(rawData, aes(x = log(boot1000), y = boot1000)) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(x = "\nNatural logarithm of BS", y = "BS\n") 
+plot2 = ggplot(rawData, aes(x = log(jack1000), y = jack1000)) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(x = "\nNatural logarithm of JK", y = "JK\n")
+grid.arrange(plot1, plot2, ncol = 2)
+
+# Square root of BS and JK
+plot1 = ggplot(rawData, aes(x = sqrt(boot1000), y = boot1000)) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(x = "\nSquare root of BS", y = "BS\n") 
+plot2 = ggplot(rawData, aes(x = sqrt(jack1000), y = jack1000)) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(x = "\nSquare root of JK", y = "JK\n")
+grid.arrange(plot1, plot2, ncol = 2)
+
+# Quadratic of BS and JK
+plot1 = ggplot(rawData, aes(x = (boot1000^2), y = boot1000)) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(x = "\nBS-squared", y = "BS\n") 
+plot2 = ggplot(rawData, aes(x = (jack1000^2), y = jack1000)) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(x = "\nJK-squared", y = "JK\n")
+grid.arrange(plot1, plot2, ncol = 2)
+
+# Normalized GB (REP)
+plot1 = ggplot(rawData, aes(x = rep, y = gb)) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(x = "REP", y = "GB\n") 
+plot1
+```
+
+
+## 3.2 OLS
+Ordinary Least Squares (OLS) is the most common method to estimate linear relationships. The six assumptions of OLS are:
+
+1. The regression is linear in its error term and coefficients. The general formula is: Y = β₀ + β₁X₁ + β₂X₂ + ... + βₖXₖ + ε. All terms are constant numbers (the intercept) or the multiplication between predictor variables and constant parameters.
+2. The population mean of error term is zero.
+3. No correlation is expected between independent variables and the error term.
+4. No correlation is expected between each observation of the error term.
+5. The variance of the error term is constant (= homoscedasticity is expected).
+6. Independent variables are not perfect linear functions of dependent variables.
+
+Here, we do not conclude whether BS and JK are good predictors of GB based only on $P$ values < 0.05. We also assessed adjusted $R^2$ (the percentage of variation explained by independent variables that affect dependent variables) and descriptive statistics of the residuals. Six diagnostic plots of residuals were analyzed:
+
+1. **Residuals vs Fitted**: if residuals are equally spread around a horizontal line (without distinct patterns) at $y = 0$, this indicates a linear relationship; otherwise, it indicates a nonlinear relationship. 
+2. **Normal Q-Q**: if residuals are lined well on the straight dashed line, this indicates that residuals are normally distributed; otherwise, this indicates that residuals are not normally distributed.
+3. **Scale-Location**: if residuals are randomly spread along the ranges of predictors in a horizontal line, this indicates homoscedasticity (equal variance of residuals); otherwise, it indicates heteroscedasticity.
+4. **Residuals vs Leverage**: if data points are within the area delimited by a dashed line representing Cook's distance, this indicates no influential outliers to the regression results; otherwise, if data points are outside the dashed line at the upper right corner or at the lower right corner, this indicates the presence of influential outliers to the regression results.
+5. **Cook's distance**: if observations with a Cook's D of more than three times the mean are present, then it is a possible outlier.
+6. **Cook's distance vs Leverage**: if high leverage observations have predictor values very discrepant from their averages, they are possible outliers.
+
+### 3.2.1 Initial OLS tests
+Below, we performed several OLS using raw and transformed data. 
+
+```{r}
+# Raw data of BS or JK
+fit <- lm(gb ~ boot1000, data = rawData)
+r <- signif(summary(fit)$adj.r.squared, 5)
+p <- signif(summary(fit)$coef[2,4], 5)
+cat(paste0("Raw data of BS: adjusted R-squared = ", r, ", P value = ", p, "\n")) 
+
+fit <- lm(gb ~ jack1000, data = rawData)
+r <- signif(summary(fit)$adj.r.squared, 5)
+p <- signif(summary(fit)$coef[2,4], 5)
+cat(paste0("Raw data of JK: adjusted R-squared = ", r, ", P value = ", p, "\n")) 
+
+# Logit of BS/100 or JK/100
+fit <- lm(gb ~ BSlogit, data = logitData)
+r <- signif(summary(fit)$adj.r.squared, 5)
+p <- signif(summary(fit)$coef[2,4], 5)
+cat(paste0("Logit of BS/100: adjusted R-squared = ", r, ", P value = ", p, "\n"))
+
+fit <- lm(gb ~ JKlogit, data = logitData)
+r <- signif(summary(fit)$adj.r.squared, 5)
+p <- signif(summary(fit)$coef[2,4], 5)
+cat(paste0("Logit of JK/100: adjusted R-squared = ", r, ", P value = ", p, "\n"))
+
+# Natural logarithm of BS or JK
+mySubset <- rawData[rawData$boot1000>0.0,]
+Y <- mySubset$gb
+X <- log(mySubset$boot1000)
+fit <- lm(Y ~ X)
+r <- signif(summary(fit)$adj.r.squared, 5)
+p <- signif(summary(fit)$coef[2,4], 5)
+cat(paste0("Ln of BS: adjusted R-squared = ", r, ", P value = ", p, "\n"))
+
+mySubset <- rawData[rawData$jack1000>0.0,]
+Y <- mySubset$gb
+X <- log(mySubset$jack1000)
+fit <- lm(Y ~ X)
+r <- signif(summary(fit)$adj.r.squared, 5)
+p <- signif(summary(fit)$coef[2,4], 5)
+cat(paste0("Ln of JK: adjusted R-squared = ", r, ", P value = ", p, "\n"))
+
+# Square root of BS or JK
+Y = mySubset$gb
+X = sqrt(mySubset$boot1000)
+fit = lm(Y ~ X)
+r = signif(summary(fit)$adj.r.squared, 5)
+p = signif(summary(fit)$coef[2,4], 5)
+cat(paste0("Square root of BS: adjusted R-squared = ", r, ", P value = ", p, "\n"))
+
+Y = mySubset$gb
+X = sqrt(mySubset$jack1000)
+fit = lm(Y ~ X)
+r = signif(summary(fit)$adj.r.squared, 5)
+p = signif(summary(fit)$coef[2,4], 5)
+cat(paste0("Square root of JK: adjusted R-squared = ", r, ", P value = ", p, "\n"))
+
+# BS-squared or JK-squared
+Y <- rawData$gb
+X <- (rawData$boot1000)^2
+fit <- lm(Y ~ X)
+r <- signif(summary(fit)$adj.r.squared, 5)
+p <- signif(summary(fit)$coef[2,4], 5)
+cat(paste0("BS-squared: adjusted R-squared = ", r, ", P value = ", p, "\n"))
+
+Y <- rawData$gb
+X <- (rawData$jack1000)^2
+fit <- lm(Y ~ X)
+r <- signif(summary(fit)$adj.r.squared, 5)
+p <- signif(summary(fit)$coef[2,4], 5)
+cat(paste0("JK-squared: adjusted R-squared = ", r, ", P value = ", p, "\n"))
+
+# Normalized GB
+Y <- shat(mySubset$gb, 0)
+X <- mySubset$boot1000
+fit <- lm(Y ~ X)
+r <- signif(summary(fit)$adj.r.squared, 5)
+p <- signif(summary(fit)$coef[2,4], 5)
+cat(paste0("Normalized GB: adjusted R-squared = ", r, ", P value = ", p, "\n"))
+
+Y <- shat(mySubset$gb, 0)
+X <- mySubset$jack1000
+fit <- lm(Y ~ X)
+r <- signif(summary(fit)$adj.r.squared, 5)
+p <- signif(summary(fit)$coef[2,4], 5)
+cat(paste0("Normalized GB: adjusted R-squared = ", r, ", P value = ", p, "\n"))
+```
+
+Based on $P$ values and $R^2$, the best transformation seems the logit of BS ($P$ < 0.05; $R^2$ = 0.51) and JK ($P$ < 0.05 ; $R^2$ = 0.51). However, $P$ values and $R^2$ are not enough to assess the correlation between GB, BS and JK. Thus, we need to better evaluate linear regressions and residual diagnostics (see below).
+
+### 3.2.2 Raw data
+
+```{r}
+# BS
+fit = lm(gb ~ boot1000, data = rawData)
+fit.summary = summary(fit)
+
+ggplotFit = function (fit) {
+    ggplot(fit$model, aes_string(x = names(fit$model)[2], y = names(fit$model)[1])) + 
+        geom_point(col = alpha("black", 0.4)) +
+        stat_smooth(method = "lm", col = "grey") +
+        labs(
+            subtitle = bquote("Adj." ~ R^2 == .(signif(summary(fit)$adj.r.squared, 5)) ~ "/ Intercept" == .(signif(fit$coef[[1]],5)) ~ "/ Slope" == .(signif(fit$coef[[2]], 5)) ~ "/ P" == .(signif(summary(fit)$coef[2,4], 5))),
+            title = "OLS linear regression of concatenated datasets"
+            )+
+        ylab("GB") +
+        xlab("BS")
+}
+ggplotFit(fit)
+
+autoplot(fit, which = 1:6, ncol = 3, label.size = 2, colour = "grey") + labs(subtitle = "Concatenated datasets")
+```
+
+Interpretations for GB ~ BS (raw data):
+
+- The Normal Q-Q plot revealed residuals that may be deviating from normality. This is expected as data is not normally distributed.
+
+- Cook's distance, Residuals vs Leverage, and Cook's distance vs leverage indicated potential outliers that can significantly affect the outcome and accuracy of the regression.
+
+```{r}
+# JK
+fit = lm(gb ~ jack1000, data = rawData)
+fit.summary = summary(fit)
+
+ggplotFit = function (fit) {
+    ggplot(fit$model, aes_string(x = names(fit$model)[2], y = names(fit$model)[1])) + 
+        geom_point(col = alpha("black", 0.4)) +
+        stat_smooth(method = "lm", col = "grey") +
+        labs(
+            subtitle = bquote("Adj." ~ R^2 == .(signif(summary(fit)$adj.r.squared, 5)) ~ "/ Intercept" == .(signif(fit$coef[[1]],5)) ~ "/ Slope" == .(signif(fit$coef[[2]], 5)) ~ "/ P" == .(signif(summary(fit)$coef[2,4], 5))),
+            title = "OLS linear regression of concatenated datasets"
+            )+
+        ylab("GB") +
+        xlab("JK")
+}
+ggplotFit(fit)
+
+autoplot(fit, which = 1:6, ncol = 3, label.size = 2, colour = "grey") + labs(subtitle = "Concatenated datasets")
+```
+
+Interpretations for GB ~ JK (raw data):
+
+- The same as for GB ~ BS (raw data)
+
+### 3.2.3 Logit of BS and JK
+
+```{r}
+# BS
+X = logitData$BSlogit
+Y = logitData$gb
+fit <- lm(Y ~ X)
+fit.summary <- summary(fit)
+# Visualize the data in a dotplot
+ggplotFit <- function (fit) {
+    ggplot(fit$model, aes_string(x = names(fit$model)[2], y = names(fit$model)[1])) + 
+        geom_point(col = alpha("black", 0.4)) +
+        stat_smooth(method = "lm", col = "grey") +
+        labs(
+            subtitle = bquote("Adj." ~ R^2 == .(signif(summary(fit)$adj.r.squared, 5)) ~ "/ Intercept" == .(signif(fit$coef[[1]],5)) ~ "/ Slope" == .(signif(fit$coef[[2]], 5)) ~ "/ P" == .(signif(summary(fit)$coef[2,4], 5))),
+            title = "OLS linear regression of concatenated datasets"
+            )+
+        ylab("GB") +
+        xlab("Logit of BS")
+}
+ggplotFit(fit)
+# Visualize diagnostic statistics of the residues
+autoplot(fit, which = 1:6, ncol = 3, label.size = 2, colour = "grey") + labs(subtitle = "Concatenated datasets")
+```
+
+Interpretations for GB ~ logit of BS:
+
+- The Residuals vs Fitted plot is U-shaped and show a problematic increased variance towards the right side of the plot. This increasing variance is worse here than in the OLS using raw data.
+
+- The Normal Q-Q plot shows that residuals are not normally distributed in the right side of the plot.
+
+- The Scale-Location shows residuals not spread along a horizontal line. It is worse than using raw data.
+
+- Other plots indicate the presence of influential outliers, similarly as the OLS using raw data.
+
+```{r}
+# JK
+X = logitData$JKlogit
+Y = logitData$gb
+fit <- lm(Y ~ X)
+fit.summary <- summary(fit)
+# Visualize the data in a dotplot
+ggplotFit <- function (fit) {
+    ggplot(fit$model, aes_string(x = names(fit$model)[2], y = names(fit$model)[1])) + 
+        geom_point(col = alpha("black", 0.4)) +
+        stat_smooth(method = "lm", col = "grey") +
+        labs(
+            subtitle = bquote("Adj." ~ R^2 == .(signif(summary(fit)$adj.r.squared, 5)) ~ "/ Intercept" == .(signif(fit$coef[[1]],5)) ~ "/ Slope" == .(signif(fit$coef[[2]], 5)) ~ "/ P" == .(signif(summary(fit)$coef[2,4], 5))),
+            title = "OLS linear regression of concatenated datasets"
+            )+
+        ylab("GB") +
+        xlab("Logit of JK") 
+}
+ggplotFit(fit)
+# Visualize diagnostic statistics of the residues
+autoplot(fit, which = 1:6, ncol = 3, label.size = 2, colour = "grey") + labs(subtitle = "Concatenated datasets")
+```
+
+Interpretations for GB ~ logit of JK:
+
+- The same as those for BS.
+
+### 3.2.4 $BS^2$ and $JK^2$
+
+```{r}
+X <- (rawData$boot1000)^2
+Y <- rawData$gb
+fit <- lm(Y ~ X)
+fit.summary <- summary(fit)
+# Visualize the data in a dotplot
+ggplotFit <- function (fit) {
+    ggplot(fit$model, aes_string(x = names(fit$model)[2], y = names(fit$model)[1])) + 
+        geom_point(col = alpha("black", 0.4)) +
+        stat_smooth(method = "lm", col = "grey") +
+        labs(
+            subtitle = bquote("Adj." ~ R^2 == .(signif(summary(fit)$adj.r.squared, 5)) ~ "/ Intercept" == .(signif(fit$coef[[1]],5)) ~ "/ Slope" == .(signif(fit$coef[[2]], 5)) ~ "/ P" == .(signif(summary(fit)$coef[2,4], 5))),
+            title = "OLS linear regression of concatenated datasets"
+            )+
+        ylab("GB") +
+        xlab(bquote(BS^2))
+}
+ggplotFit(fit)
+# Visualize diagnostic statistics of the residues
+autoplot(fit, which = 1:6, ncol = 3, label.size = 2, colour = "grey") + labs(subtitle = "Concatenated datasets")
+```
+
+Interpretations of GB ~ $BS^2$:
+
+- The Residuals vs Fitted plot is better than the OLS using logit of BS.
+
+- The Normal Q-Q shows that residuals are not normally distributed in the right side of the plot
+
+- The Scale-Location shows residuals not spread along a horizontal line, especially at the right corner, albeit it is better than the OLS using logit of BS.
+
+- The other plots revealed influential outliers that may impact the regression results.
+
+```{r}
+X <- (rawData$jack1000)^2
+Y <- rawData$gb
+fit <- lm(Y ~ X)
+fit.summary <- summary(fit)
+# Visualize the data in a dotplot
+ggplotFit <- function (fit) {
+    ggplot(fit$model, aes_string(x = names(fit$model)[2], y = names(fit$model)[1])) + 
+        geom_point(col = alpha("black", 0.4)) +
+        stat_smooth(method = "lm", col = "grey") +
+        labs(
+            subtitle = bquote("Adj." ~ R^2 == .(signif(summary(fit)$adj.r.squared, 5)) ~ "/ Intercept" == .(signif(fit$coef[[1]],5)) ~ "/ Slope" == .(signif(fit$coef[[2]], 5)) ~ "/ P" == .(signif(summary(fit)$coef[2,4], 5))),
+            title = "OLS linear regression of concatenated datasets"
+            )+
+        ylab("GB") +
+        xlab(bquote(JK^2))
+}
+ggplotFit(fit)
+# Visualize diagnostic statistics of the residues
+autoplot(fit, which = 1:6, ncol = 3, label.size = 2, colour = "grey") + labs(subtitle = "Concatenated datasets")
+```
+
+Interpretations of GB ~ $JK^2$:
+
+- The same as those for GB ~ $BS^2$
+
+### 3.2.5 Log of BS and JK
+
+```{r}
+mySubset <- rawData[rawData$boot1000>0.0,]
+Y <- mySubset$gb
+X <- log(mySubset$boot1000)
+fit <- lm(Y ~ X)
+fit.summary <- summary(fit)
+# Visualize the data in a dotplot
+ggplotFit <- function (fit) {
+    ggplot(fit$model, aes_string(x = names(fit$model)[2], y = names(fit$model)[1])) + 
+        geom_point(col = alpha("black", 0.4)) +
+        stat_smooth(method = "lm", col = "grey") +
+        labs(
+            subtitle = bquote("Adj." ~ R^2 == .(signif(summary(fit)$adj.r.squared, 5)) ~ "/ Intercept" == .(signif(fit$coef[[1]],5)) ~ "/ Slope" == .(signif(fit$coef[[2]], 5)) ~ "/ P" == .(signif(summary(fit)$coef[2,4], 5))),
+            title = "OLS linear regression of concatenated datasets"
+            )+
+        ylab("GB") +
+        xlab("log BS")
+}
+ggplotFit(fit)
+# Visualize diagnostic statistics of the residues
+autoplot(fit, which = 1:6, ncol = 3, label.size = 2, colour = "grey") + labs(subtitle = "Concatenated datasets")
+```
+
+Interpretations of GB ~ log BS:
+
+- The Normal Q-Q shows that residuals are not normally distributed in the right side of the plot
+
+- The Scale-Location shows residuals not spread along a horizontal line, especially at the right corner, albeit it is better than the OLS using logit of BS.
+
+- The other plots revealed influential outliers that may impact the regression results.
+
+```{r}
+mySubset <- rawData[rawData$jack1000>0.0,]
+Y <- mySubset$gb
+X <- log(mySubset$jack1000)
+fit <- lm(Y ~ X)
+fit.summary <- summary(fit)
+# Visualize the data in a dotplot
+ggplotFit <- function (fit) {
+    ggplot(fit$model, aes_string(x = names(fit$model)[2], y = names(fit$model)[1])) + 
+        geom_point(col = alpha("black", 0.4)) +
+        stat_smooth(method = "lm", col = "grey") +
+        labs(
+            subtitle = bquote("Adj." ~ R^2 == .(signif(summary(fit)$adj.r.squared, 5)) ~ "/ Intercept" == .(signif(fit$coef[[1]],5)) ~ "/ Slope" == .(signif(fit$coef[[2]], 5)) ~ "/ P" == .(signif(summary(fit)$coef[2,4], 5))),
+            title = "OLS linear regression of concatenated datasets"
+            )+
+        ylab("GB") +
+        xlab("log JK")
+}
+ggplotFit(fit)
+# Visualize diagnostic statistics of the residues
+autoplot(fit, which = 1:6, ncol = 3, label.size = 2, colour = "grey") + labs(subtitle = "Concatenated datasets")
+```
+
+Interpretations of GB ~ log JK:
+
+- The same as those for GB ~ log BS
+
+### 3.2.6 Box Cox transformation
+
+Box Cox transformations were designed to reduce the non-normality of the errors in a linear model. Let's check whether Box Cox transformations solve the problems of residuals statistics observed in the previous models using raw data, logit, and squared predictors.
+
+```{r}
+# One-parameter Box Cox transformation for BS
+## Get data
+rawData = read_csv("data.csv")
+rawData = subset(rawData, !grepl("\\?", boot1000))
+rawData = rawData[rawData$gb > 0, ]
+rawData$gb = as.numeric(rawData$gb)
+rawData$boot1000 = as.numeric(rawData$boot1000)
+rawData$jack1000 = as.numeric(rawData$jack1000)
+y <- rawData$gb
+x <- rawData$boot1000
+
+## Run a linear model
+m <- lm(y ~ x)
+
+## Run the box-cox transformation
+bc <- boxcox(y ~ x)
+
+## Get lambda
+lambda <- bc$x[which.max(bc$y)]
+print(lambda)
+
+## Re-run with transformation
+fit <- lm(powerTransform(y, lambda) ~ x)
+summary(fit)
+
+# Visualize the data in a dotplot
+ggplotFit <- function (fit) {
+    ggplot(fit$model, aes_string(x = names(fit$model)[2], y = names(fit$model)[1])) + 
+        geom_point(col = alpha("black", 0.4)) +
+        stat_smooth(method = "lm", col = "grey") +
+        labs(
+            subtitle = bquote("Adj." ~ R^2 == .(signif(summary(fit)$adj.r.squared, 5)) ~ "/ Intercept" == .(signif(fit$coef[[1]],5)) ~ "/ Slope" == .(signif(fit$coef[[2]], 5)) ~ "/ P" == .(signif(summary(fit)$coef[2,4], 5))),
+            title = "OLS linear regression of concatenated datasets after Box Cox transformation"
+            )+
+        ylab("transformed GB") +
+        xlab("transformed BS")
+}
+ggplotFit(fit)
+
+# Visualize diagnostic statistics of the residues
+autoplot(fit, which = 1:6, ncol = 3, label.size = 2, colour = "grey") + labs(subtitle = "Concatenated datasets")
+```
+
+Interpretations of GB ~ BS (Box Cox transformations):
+
+- The Residuals vs Fitted shows a pronounced U-shaped curve, indicating a clear nonlinear relationship.
+
+- The Normal Q-Q is improved in relation to other transformations, indicating that residuals are not deviating from normality.
+
+- The Scale-Location plot shows residuals not equally spread along a horizontal line, indicating heteroscedasticity.
+
+- Cook’s distance, Residuals vs Leverage, and Cook’s distance vs leverage indicated potential outliers that can significantly affect the outcome and accuracy of the regression.
+
+```{r}
+# One-parameter Box Cox transformation for JK
+## Get data
+rawData = read_csv("data.csv")
+rawData = subset(rawData, !grepl("\\?", boot1000)) 
+rawData = rawData[rawData$gb > 0, ]
+rawData$gb = as.numeric(rawData$gb)
+rawData$boot1000 = as.numeric(rawData$boot1000)
+rawData$jack1000 = as.numeric(rawData$jack1000)
+y <- rawData$gb
+x <- rawData$jack1000
+
+## Run a linear model
+m <- lm(y ~ x)
+
+## Run the box-cox transformation
+bc <- boxcox(y ~ x)
+
+## Get lambda
+lambda <- bc$x[which.max(bc$y)]
+print(lambda)
+
+## Re-run with transformation
+fit <- lm(powerTransform(y, lambda) ~ x)
+summary(fit)
+
+# Visualize the data in a dotplot
+ggplotFit <- function (fit) {
+    ggplot(fit$model, aes_string(x = names(fit$model)[2], y = names(fit$model)[1])) + 
+        geom_point(col = alpha("black", 0.4)) +
+        stat_smooth(method = "lm", col = "grey") +
+        labs(
+            subtitle = bquote("Adj." ~ R^2 == .(signif(summary(fit)$adj.r.squared, 5)) ~ "/ Intercept" == .(signif(fit$coef[[1]],5)) ~ "/ Slope" == .(signif(fit$coef[[2]], 5)) ~ "/ P" == .(signif(summary(fit)$coef[2,4], 5))),
+            title = "OLS linear regression of concatenated datasets after Box Cox transformation"
+            )+
+        ylab("transformed GB") +
+        xlab("transformed JK")
+}
+ggplotFit(fit)
+
+# Visualize diagnostic statistics of the residues
+autoplot(fit, which = 1:6, ncol = 3, label.size = 2, colour = "grey") + labs(subtitle = "Concatenated datasets")
+```
+
+Interpretations of GB ~ JK (Box Cox transformations):
+
+- The same as those for GB ~ BS.
+
+### 3.2.7 REP ~ BS and JK (EXPLICAR!!)
+
+```{r}
+# REP ~ BS
+
+## Get data
+rawData = read_csv("data.csv")
+rawData = subset(rawData, !grepl("\\?", boot1000)) 
+rawData = rawData[rawData$gb > 0, ]
+rawData$gb = as.numeric(rawData$gb)
+rawData$boot1000 = as.numeric(rawData$boot1000)
+rawData$jack1000 = as.numeric(rawData$jack1000)
+y <- rawData$rep100
+x <- rawData$boot1000
+
+## Run a linear model
+fit <- lm(y ~ x)
+summary(fit)
+
+## Diagnostics
+ggplotFit = function (fit) {
+    ggplot(fit$model, aes_string(x = names(fit$model)[2], y = names(fit$model)[1])) + 
+        geom_point(col = alpha("black", 0.4)) +
+        stat_smooth(method = "lm", col = "grey") +
+        labs(
+            subtitle = bquote("Adj." ~ R^2 == .(signif(summary(fit)$adj.r.squared, 5)) ~ "/ Intercept" == .(signif(fit$coef[[1]],5)) ~ "/ Slope" == .(signif(fit$coef[[2]], 5)) ~ "/ P" == .(signif(summary(fit)$coef[2,4], 5))),
+            title = "OLS linear regression of concatenated datasets"
+            )+
+        ylab("REP") +
+        xlab("BS")
+}
+ggplotFit(fit)
+
+autoplot(fit, which = 1:6, ncol = 3, label.size = 2, colour = "grey") + labs(subtitle = "Concatenated datasets")
+```
+
+```{r}
+# REP ~ JK
+
+## Get data
+rawData = read_csv("data.csv")
+rawData = subset(rawData, !grepl("\\?", boot1000)) 
+rawData = rawData[rawData$gb > 0, ]
+rawData$gb = as.numeric(rawData$gb)
+rawData$boot1000 = as.numeric(rawData$boot1000)
+rawData$jack1000 = as.numeric(rawData$jack1000)
+y <- rawData$rep100
+x <- rawData$jack1000
+
+## Run a linear model
+fit <- lm(y ~ x)
+summary(fit)
+
+## Diagnostics
+ggplotFit = function (fit) {
+    ggplot(fit$model, aes_string(x = names(fit$model)[2], y = names(fit$model)[1])) + 
+        geom_point(col = alpha("black", 0.4)) +
+        stat_smooth(method = "lm", col = "grey") +
+        labs(
+            subtitle = bquote("Adj." ~ R^2 == .(signif(summary(fit)$adj.r.squared, 5)) ~ "/ Intercept" == .(signif(fit$coef[[1]],5)) ~ "/ Slope" == .(signif(fit$coef[[2]], 5)) ~ "/ P" == .(signif(summary(fit)$coef[2,4], 5))),
+            title = "OLS linear regression of concatenated datasets"
+            )+
+        ylab("REP") +
+        xlab("JK")
+}
+ggplotFit(fit)
+
+autoplot(fit, which = 1:6, ncol = 3, label.size = 2, colour = "grey") + labs(subtitle = "Concatenated datasets")
+```
+
+# 4. Non-parametric tests
+
+The diagnostic statistics of residuals of parametric tests using different transformations indicated that non-parametric tests could perform better for our data. In this section, we performed (1) Pearson's and Spearm's correlations, (2) Quantile regressions using raw and Box-Cox transformed data, (3) estimated overestimation and underestimation of resampling metrics as predictors of support (GB).
+
+## 4.1 Pearson's and Spearman's correlations
+
+Pearson's and Spearman's correlation are two different methods used to measure the strength and direction of the relationship between two variables. However, both methods present some differences:
+
+- **Pearson's correlation**: measures the linear relationship between two continuous variables; requires a normal distribution; it ranges from -1 (perfect negative correlation) to +1 (perfect positive correlation); sensitive to outliers since means and variances are calculated. 
+
+- **Spearman's Rank correlation**: measures the strength and direction of the monotonic relationship between two variables (i.e. monotonic implies that as one variable increases, the other variable either consistently increases or consistently decreases, but not necessarily at constant rate; linear, however, implies a consistent and constant rate of change); suitable for continuous and ordinal variables; less sensitive to outliers than Pearson's correlation because it is based on ranked values rather than raw data.
+
+```{r}
+x = rawData$boot1000
+y = rawData$gb
+
+# Pearson's correlation: GB ~ BS
+pearson = cor.test(y, x, method = "pearson", exact = F, alternative = "two.sided")
+p <- pearson$p.value
+r <- pearson$estimate
+r2 <- pearson$estimate^2
+cat(paste0("These are the results from the (parametric) Pearson's correlation test for GB~BS:\nP = ", p, "\nR = ", r, "\nR-squared = ", r2))
+
+# Spearman's correlation: GB ~ BS
+spearman <- cor.test(y, x, method = "spearman", exact = FALSE, alternative =  "two.sided")
+p <- spearman$p.value
+r <- spearman$estimate
+r2 <- spearman$estimate^2
+cat(paste0("\nThese are the results from the (non-parametric) Spearman's (rank) correlation test for GB~BS:\nP = ", p, "\nR = ", r, "\nR-squared = ", r2))
+```
+
+
+```{r}
+x = rawData$jack1000
+y = rawData$gb
+
+# Pearson's correlation: GB ~ JK
+pearson = cor.test(y, x, method = "pearson", exact = F, alternative = "two.sided")
+p <- pearson$p.value
+r <- pearson$estimate
+r2 <- pearson$estimate^2
+cat(paste0("These are the results from the (parametric) Pearson's correlation test for GB~JK:\nP = ", p, "\nR = ", r, "\nR-squared = ", r2))
+
+# Spearman's correlation: GB ~ JK
+spearman <- cor.test(y, x, method = "spearman", exact = FALSE, alternative =  "two.sided")
+p <- spearman$p.value
+r <- spearman$estimate
+r2 <- spearman$estimate^2
+cat(paste0("\nThese are the results from the (non-parametric) Spearman's (rank) correlation test for GB~JK:\nP = ", p, "\nR = ", r, "\nR-squared = ", r2))
+
+```
+
+Overall, results using BS and JK as predictors are congruent. Both shows a higher $R^2$ using the Spearman's correlation than using the Pearson's method. This indicates that the relationship between GB and BS or JK is non-parametric and non-linear (without a constant rate of change across all quantiles), which reduces the usefulness of BS and JK as a straightforward predictor of support.
+
+## 4.2 Quantile regressions
+
+While OLS focuses on how the predictors affect the mean of the response variable, quantile regression analysis (QRA) focus on how the predictors affect the conditional quantiles of the response variable (e.g. median, quartiles, or any quantile). Thus, OLS may be biased by outliers, whereas QRA is more robust against them. Furthermore, QRA can produce a Nagelkerke's (pseudo) $R^2$ that facilitates interpretations of results.
+
+In this section, we will perform (1) QRA for counts (considering GB as count) and (2) QRA using Box Cox transformation of GB.
+
+### 4.2.1 QRA for counts
+
+The QRA analyses are suitable for continuous response variables. However, GB is a counting (the difference between the globally optimal tree cost and the next-best tree without a given clade; GB is always integer numbers, either positive or negative). Thus, we can use a QRA for counts available in the lqmm package.
+
+```{r}
+# QRA considering GB as count data
+library(lqmm)
+df = rawData 
+
+# GB ~ BS
+quantreg.median = lqm.counts(gb ~ boot1000, df, tau = 0.5)
+quantreg.median
+# Null hypothesis
+quantreg.null <- lqm.counts(gb ~ 1, tau = 0.5, data = df)
+
+# Diagnostics: Similarity between observed and predicted GB; predicted should be similar to observed if the model is well-fit
+plot(density(df$gb))
+lines(density(predict(quantreg.median, type='deviance')), col='red')
+# Diagnostics: Residuals vs Fitted
+plot(fitted(quantreg.median), residuals(quantreg.median), 
+     xlab = "Fitted Values", ylab = "Residuals", 
+     main = "Residuals vs. Fitted Values")
+abline(h = 0, col = "red", lty = 2)
+# Quantile-Quantile (Q-Q) Plot
+qqnorm(residuals(quantreg.median))
+qqline(residuals(quantreg.median), col="red")
+```
+
+```{r}
+# QRA considering GB as count data
+library(lqmm)
+df = rawData 
+
+# GB ~ JK
+quantreg.median = lqm.counts(gb ~ jack1000, df, tau = 0.5)
+quantreg.median
+# Null model
+quantreg.null <- lqm.counts(gb ~ 1, tau = 0.5, data = df)
+
+# Diagnostics: Similarity between observed and predicted GB; predicted should be similar to observed if the model is well-fit
+plot(density(df$gb))
+lines(density(predict(quantreg.median, type='deviance')), col='red')
+# Diagnostics: Residuals vs Fitted
+plot(fitted(quantreg.median), residuals(quantreg.median), 
+     xlab = "Fitted Values", ylab = "Residuals", 
+     main = "Residuals vs. Fitted Values")
+abline(h = 0, col = "red", lty = 2)
+# Quantile-Quantile (Q-Q) Plot
+qqnorm(residuals(quantreg.median))
+qqline(residuals(quantreg.median), col="red")
+```
+
+### 4.2.2 QRA for Box Cox transformation of GB
+
+Here we perform the QRA using the Box Cox transformed GB values. This is an alternative way to analyze the correlation between GB and resampling metrics without explicitly considering GB as count data in the model.
+
+```{r}
+library(quantreg)
+
+# QRA for data: Box Cox GB ~ BS
+df = rawData 
+df = df[df$gb > 0, ]
+bc <- boxcox(df$gb ~ df$boot1000)
+lambda = bc$x[which.max(bc$y)]
+df$GBtransformed <- powerTransform(df$gb, lambda) # append Box Cox GB to df
+
+quantreg.median <- rq(GBtransformed ~ boot1000, data = df, tau = 0.5)
+summary(quantreg.median)
+print(nagelkerke(quantreg.median))
+# Null hypothesis
+quantreg.null <- rq(GBtransformed ~ 1, tau = 0.5, data = df)
+
+# Visualize the data
+ggplotQR <- function (quantreg.median, quantreg.null) {
+    ggplot(quantreg.median$model, aes_string(x = names(quantreg.median$model)[2], y = names(quantreg.median$model)[1])) + 
+        geom_point(pch = 1, size = 2,  alpha = 0.2, col = "grey") +
+        geom_abline(intercept=coef(quantreg.median)[1], slope=coef(quantreg.median)[2], col = "black", size = 1) +
+    geom_smooth(method = "lm", se = F, linetype = "dotted", col = "blue") +
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black")) +
+        labs(subtitle = bquote("P" == .(signif(anova(quantreg.median, quantreg.null)[[1]][1,4], digits=3)) ~ "Pseudo" ~ R^2 == .(signif(nagelkerke(quantreg.median)[[2]][3,1], digits=3)) ~ "Intercept" == .(signif(coefficients(quantreg.median)[1], digits=3)) ~ "Slope" == .(signif(coefficients(quantreg.median)[2], digits=3))),
+        title = "Quantile regression using the concatenated dataset")+
+        ylab("Box Cox transformation of GB\n") +
+        xlab("\nBS") +
+    ylim(-0.5, 2.5)+
+    annotate("text", y = 10, x = 0, label = "Continuos black line: quantile regression", hjust = 0) + 
+    annotate("text", y = 9, x = 0, label = "Dotted blue line: linear regression", hjust = 0)
+}
+ggplotQR(quantreg.median, quantreg.null)
+
+# Visualize the data with more details
+ggplotQR2 <- function (quantreg.median, quantreg.null) {
+    ggplot(quantreg.median$model, aes_string(x = names(quantreg.median$model)[2], y = names(quantreg.median$model)[1])) + 
+        geom_point(pch = 19, size = 2,  alpha = 0.4, col = "grey") +
+        geom_abline(intercept=coef(rq(GBtransformed ~ boot1000, data = df, tau = 0.05))[1], slope=coef(rq(GBtransformed ~ boot1000, data = df, tau = 0.05))[2], col = "green", size = 0.5) +
+    geom_abline(intercept=coef(rq(GBtransformed ~ boot1000, data = df, tau = 0.25))[1], slope=coef(rq(GBtransformed ~ boot1000, data = df, tau = 0.25))[2], col = "blue", size = 0.5) +
+    geom_abline(intercept=coef(quantreg.median)[1], slope=coef(quantreg.median)[2], col = "yellow", size = 1) +
+    geom_abline(intercept=coef(rq(GBtransformed ~ boot1000, data = df, tau = 0.75))[1], slope=coef(rq(GBtransformed ~ boot1000, data = df, tau = 0.75))[2], col = "orange", size = 0.5) +
+    geom_abline(intercept=coef(rq(GBtransformed ~ boot1000, data = df, tau = 0.95))[1], slope=coef(rq(GBtransformed ~ boot1000, data = df, tau = 0.95))[2], col = "red", size = 0.5) +
+        labs(subtitle = bquote("P" == .(signif(anova(quantreg.median, quantreg.null)[[1]][1,4], digits=3)) ~ "Pseudo" ~ R^2 == .(signif(nagelkerke(quantreg.median)[[2]][3,1], digits=3)) ~ "Intercept" == .(signif(coefficients(quantreg.median)[1], digits=3)) ~ "Slope" == .(signif(coefficients(quantreg.median)[2], digits=3))),
+        title = "Quantile regression using the concatenated dataset")+
+        ylab("Box Cox transformation of GB\n") +
+        xlab("\nBS") +
+    annotate("text", y = 2.5, x = 0, label = "- Red: tau = 0.95", hjust = 0) +
+    annotate("text", y = 2.3, x = 0, label = "- Orange: tau = 0.75", hjust = 0) +
+    annotate("text", y = 2.1, x = 0, label = "- Yellow: tau = 0.5", hjust = 0) +
+    annotate("text", y = 1.9, x = 0, label = "- Blue: tau = 0.25", hjust = 0) +
+    annotate("text", y = 1.7, x = 0, label = "- Green: tau = 0.05", hjust = 0) +
+    ylim(-0.5, 2.5) + xlim(0, 100) +
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+}
+ggplotQR2(quantreg.median, quantreg.null)
+
+# Separate QRA for tau = 0.05
+quantreg.median <- rq(GBtransformed ~ boot1000, data = df, tau = 0.05)
+summary(quantreg.median) 
+print(nagelkerke(quantreg.median))
+```
+
+Interpretations of QRA: Box Cox GB ~ BS
+
+- The pseudo $R^2$ is 0.72 with a significant $P$ values of 0.
+
+- The green tendency line for 0.05 is particularly different from other tendency lines of tau = 0.25, 0.5, 0.75, and 0.95. Thus, although the change of one-unit of BS change the median (tau = 0.5) of Box Cox transformed GB, one-unit change in BS does not change the 5th percentile of Box Cox transformed GB. Tau = 0.05 is useful to examine the lower tail of the conditional distribution of the response variable (e.g. how BS affects the low values of Box Cox of GB). In summary, the significance in quantile regression can vary across different quantiles of GB, indicating varying levels of statistical significance for the predictor coefficients at different parts of the distribution. 
+
+- As noted by Machado et al. (2022), "it is crucial to remember that (1) the threshold for a "respectable" pseudo-R2 values may be higher than the same threshold for adjusted R2, and (2) a pseudo R2 does not have the same interpretation as does R2 in a linear model."
+
+```{r}
+library(quantreg)
+
+# QRA for raw data: GB ~ JK
+df = rawData 
+df = df[df$gb > 0, ]
+bc <- boxcox(df$gb ~ df$jack1000)
+lambda = bc$x[which.max(bc$y)]
+df$GBtransformed <- powerTransform(df$gb, lambda) # append Box Cox GB to df
+
+quantreg.median <- rq(GBtransformed ~ jack1000, data = df, tau = 0.5)
+summary(quantreg.median)
+print(nagelkerke(quantreg.median))
+# Null hypothesis
+quantreg.null <- rq(GBtransformed ~ 1, tau = 0.5, data = df)
+
+# Visualize the data
+ggplotQR <- function (quantreg.median, quantreg.null) {
+    ggplot(quantreg.median$model, aes_string(x = names(quantreg.median$model)[2], y = names(quantreg.median$model)[1])) + 
+        geom_point(pch = 1, size = 2,  alpha = 0.2, col = "grey") +
+        geom_abline(intercept=coef(quantreg.median)[1], slope=coef(quantreg.median)[2], col = "black", size = 1) +
+    geom_smooth(method = "lm", se = F, linetype = "dotted", col = "blue") +
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black")) +
+        labs(subtitle = bquote("P" == .(signif(anova(quantreg.median, quantreg.null)[[1]][1,4], digits=3)) ~ "Pseudo" ~ R^2 == .(signif(nagelkerke(quantreg.median)[[2]][3,1], digits=3)) ~ "Intercept" == .(signif(coefficients(quantreg.median)[1], digits=3)) ~ "Slope" == .(signif(coefficients(quantreg.median)[2], digits=3))),
+        title = "Quantile regression using the concatenated dataset")+
+        ylab("Box Cox transformation of GB\n") +
+        xlab("\nJK") +
+    ylim(-0.5, 2.5)+
+    annotate("text", y = 10, x = 0, label = "Continuos black line: quantile regression", hjust = 0) + 
+    annotate("text", y = 9, x = 0, label = "Dotted blue line: linear regression", hjust = 0)
+}
+ggplotQR(quantreg.median, quantreg.null)
+
+# Visualize the data with more details
+ggplotQR2 <- function (quantreg.median, quantreg.null) {
+    ggplot(quantreg.median$model, aes_string(x = names(quantreg.median$model)[2], y = names(quantreg.median$model)[1])) + 
+        geom_point(pch = 19, size = 2,  alpha = 0.4, col = "grey") +
+        geom_abline(intercept=coef(rq(GBtransformed ~ jack1000, data = df, tau = 0.05))[1], slope=coef(rq(GBtransformed ~ jack1000, data = df, tau = 0.05))[2], col = "green", size = 0.5) +
+    geom_abline(intercept=coef(rq(GBtransformed ~ jack1000, data = df, tau = 0.25))[1], slope=coef(rq(GBtransformed ~ jack1000, data = df, tau = 0.25))[2], col = "blue", size = 0.5) +
+    geom_abline(intercept=coef(quantreg.median)[1], slope=coef(quantreg.median)[2], col = "yellow", size = 1) +
+    geom_abline(intercept=coef(rq(GBtransformed ~ jack1000, data = df, tau = 0.75))[1], slope=coef(rq(GBtransformed ~ jack1000, data = df, tau = 0.75))[2], col = "orange", size = 0.5) +
+    geom_abline(intercept=coef(rq(GBtransformed ~ jack1000, data = df, tau = 0.95))[1], slope=coef(rq(GBtransformed ~ jack1000, data = df, tau = 0.95))[2], col = "red", size = 0.5) +
+        labs(subtitle = bquote("P" == .(signif(anova(quantreg.median, quantreg.null)[[1]][1,4], digits=3)) ~ "Pseudo" ~ R^2 == .(signif(nagelkerke(quantreg.median)[[2]][3,1], digits=3)) ~ "Intercept" == .(signif(coefficients(quantreg.median)[1], digits=3)) ~ "Slope" == .(signif(coefficients(quantreg.median)[2], digits=3))),
+        title = "Quantile regression using the concatenated dataset")+
+        ylab("Box Cox transformation of GB\n") +
+        xlab("\nBS") +
+    annotate("text", y = 2.5, x = 0, label = "- Red: tau = 0.95", hjust = 0) +
+    annotate("text", y = 2.3, x = 0, label = "- Orange: tau = 0.75", hjust = 0) +
+    annotate("text", y = 2.1, x = 0, label = "- Yellow: tau = 0.5", hjust = 0) +
+    annotate("text", y = 1.9, x = 0, label = "- Blue: tau = 0.25", hjust = 0) +
+    annotate("text", y = 1.7, x = 0, label = "- Green: tau = 0.05", hjust = 0) +
+    ylim(-0.5, 2.5) + xlim(0, 100) +
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+}
+ggplotQR2(quantreg.median, quantreg.null)
+```
+
+```{r}
+# Separate QRA for tau = 0.05
+quantreg.median <- rq(GBtransformed ~ jack1000, data = df, tau = 0.05)
+summary(quantreg.median)
+print(nagelkerke(quantreg.median))
+```
+
+Interpretations for QRA: Box Cox GB ~ JK:
+
+- The same as those for  QRA: Box Cox GB ~ BS.
+
+## 4.3 Overestimation and underestimation
+
+Among all the tests conducted above, the quantile regressions may be slightly better to predict support based on BS and JK. Thus, we will use these two non-parametric tests to estimate how much BS and JK underestimate and overestimate support in parsimony analyses considering predicted values and 95% confidence intervals.
+
+We can calculate under- and overestimation using two strategies: (1) classifying the GB values of each matrix in adequate, under- or overestimated based on training 95% confidence intervals for all data; and (2) split the data in training (80%) and testing (20%) datasets, a common practice in Machine Learning.
+
+```{r}
+# Using QRA with Box Cox data
+library("quantreg")
+
+# Read data
+rawData = read_csv("data.csv")
+rawData = subset(rawData, !grepl("\\?", boot1000)) # remove unshared nodes
+rawData = rawData[rawData$gb > 0, ]
+rawData$gb = as.numeric(rawData$gb)
+rawData$boot1000 = as.numeric(rawData$boot1000)
+rawData$jack1000 = as.numeric(rawData$jack1000)
+# Box Cox data
+bc <- boxcox(rawData$gb ~ rawData$boot1000)
+lambda <- bc$x[which.max(bc$y)]
+transformedData <- rawData 
+transformedData = transformedData[, c(2,4,9)]
+colnames(transformedData)[colnames(transformedData) == "boot1000"] <- "BS"
+colnames(transformedData)[colnames(transformedData) == "study"] <- "Dataset"
+transformedData$gb <- powerTransform(rawData$gb, lambda) # Apply the Box Cox 
+
+# QRA: Box Cox GB ~ BS
+model = rq(gb ~ BS, data=transformedData, tau=0.5) 
+
+# STRATEGY 1
+# Create some vectors to store the results
+Dataset <- c()
+Overestimated <- c()
+Underestimated <- c()
+Adequate <- c()
+
+# Begin the for loop
+for (name in unique(transformedData$Dataset)) {
+  ## Get data
+  matrix <- transformedData[transformedData$Dataset==name,]
+  BS <- matrix$BS
+  BS <- data.frame(BS) # Create a separate dataframe for each matrix
+  ## Get prediction
+  predictions <- predict.rq(model, newdata = BS, interval="confidence", level = 0.95) 
+  
+  ## Categorize results
+  Cut <- data.frame(predictions)
+  Cut$BS <- matrix$BS
+  Cut$gb <- matrix$gb
+  # If GB is within the CI, the model adequately predicts the observed value 
+  Cut$Cut <- "Adequate"
+  Cut$Cut[Cut$gb >= Cut$lower & Cut$gb <= Cut$higher] <- "Adequate"
+  # If GB is lower than CI, the model overestimates the observed value
+  Cut$Cut[Cut$gb < Cut$lower] <- "Overestimated"
+  # If GB is higher than CI, the model underestimates the observed value
+  Cut$Cut[Cut$gb > Cut$higher] <- "Underestimated"
+  Over = length(Cut$Cut[Cut$Cut == "Overestimated"])
+  Under = length(Cut$Cut[Cut$Cut == "Underestimated"])
+  Total = length(Cut$Cut)
+  Over = (Over/Total)
+  Under = (Under/Total)
+  Okay = 1.0 - (Over + Under)
+  
+  # Append results
+  Dataset <- append(Dataset, name)
+  Overestimated <- append(Overestimated, Over)
+  Underestimated <- append(Underestimated, Under)
+  Adequate <- append(Adequate, Okay)
+}
+
+# Create dataframe
+Results <- data.frame(Dataset, Overestimated, Adequate, Underestimated)
+Results$Dataset <- as.factor(Results$Dataset)
+Factors <- Results[order(Results$Underestimated),]$Dataset
+Melted <- melt(Results, "Dataset")
+Melted$Dataset <- factor(Melted$Dataset, levels=Factors)
+
+# Create plot
+p <- ggplot(Melted, aes(x = Dataset, y = value, fill = variable))
+p <- p + geom_col(colour = "black", position = "fill")
+p <- p + scale_y_continuous(labels = scales::percent)
+p <- p + scale_fill_manual(name="Support estimations\n(confidence intervals of 95%)", values = c("grey70", "white", "grey10"))
+p <- p + theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(), legend.position = c(0.2, 0.8))
+p <- p + labs(x = "Datasets", y = "Frequency") + 
+  theme(
+    axis.title.x = element_text(size = 12),  
+    axis.title.y = element_text(size = 12))
+print(p)
+
+# Export image into PDF file
+pdf("fig_CI_strategy1_GB_BS.pdf", width = 8, height = 5.4)
+print(p)
+dev.off()
+```
+
+As we can see above, most values of support (GB) are either overestimated or underestimated using BS as predictor. BS is a good estimator of GB in only a few clades, but in some datasets no clades at all have GB adequately predicted by BS. 
+
+We can now perform the second strategy: split the data in 80% for training and 20% for testing, a common practice in Machine Learning. The training datasets will be used to estimate confidence intervals and the testing datasets to estimat how frequently BS under- or overestimates GB.
+
+```{r}
+# STRATEGY 2
+
+# Read data
+rawData = read_csv("data.csv")
+rawData = subset(rawData, !grepl("\\?", boot1000)) # remove unshared nodes
+rawData = rawData[rawData$gb > 0, ]
+rawData$gb = as.numeric(rawData$gb)
+rawData$boot1000 = as.numeric(rawData$boot1000)
+rawData$jack1000 = as.numeric(rawData$jack1000)
+# Box Cox data
+bc <- boxcox(rawData$gb ~ rawData$boot1000)
+lambda <- bc$x[which.max(bc$y)]
+rawData$gb <- powerTransform(rawData$gb, lambda)
+set.seed(123)
+training.samples <- rawData$gb %>% # Split the data into training and test
+  createDataPartition(p = 0.8, list = FALSE)
+train.data  <- rawData[training.samples, ]
+test.data <- rawData[-training.samples, ]
+
+# Calculate a quantile regression models for tau=0.5 using the training data
+model50 <- rq(gb ~ boot1000, data=train.data, tau=0.50)
+# Prediction using the testing data
+predictions50 <- predict.rq(model50, newdata=test.data, interval="confidence", level=0.95)
+# Summary for tau=50%
+summary(predictions50)
+# Classify predictions
+Cut$Cut <- "NA"
+Cut$Cut[Cut$gb >= Cut$lower & Cut$gb <= Cut$higher] <- "Adequate"
+Cut$Cut[Cut$gb < Cut$lower] <- "Overestimated"
+Cut$Cut[Cut$gb > Cut$higher] <- "Underestimated"
+
+# Count
+Over = length(Cut$Cut[Cut$Cut == "Overestimated"])
+Under = length(Cut$Cut[Cut$Cut == "Underestimated"])
+Total = length(Cut$Cut)
+cat(paste0("Total = ", Total, ", underestimated = ", Under, ", overestimated = ", Over, "\n"))
+
+# Plot
+p <- ggplot(Cut, aes(x = BS, y = gb)) +
+  geom_ribbon( aes(ymin = lower, ymax = higher), alpha = .25) +
+  geom_point(aes(color = Cut, shape = Cut), size = 2) +
+  geom_line( aes(y = fit), size = 0.5, linetype = "dashed") +
+  scale_colour_manual(values = c("grey", "black", "black")) +
+  scale_shape_manual(values = c(16, 21, 16)) +
+  ggtitle("Quantile regression") +
+  ylab("Box Cox transformation of GB values") +
+  xlab("Raw BS values") +
+  labs(color= "", shape = "") +
+  theme(legend.position = c(0.15, 0.9),
+        axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+p
+# Export image as PDF
+pdf("fig_CI_strategy2_GB_BS.pdf", width = 6, height = 4)
+print(p)
+dev.off()
+```
+
+As we can see above, BS is not a good predictor of Box Cox transformed values of GB, as indicated by both strategies above (training a model with all data or splitting data). Although $P$ values are lower than the significance level of 0.05, BS mostly underestimates or overestimates GB. 
+
+Now we will repeat the two strategies above using JK as predictor of GB.
+
+```{r}
+# Using QRA with Box Cox data
+library("quantreg")
+
+# Read data
+rawData = read_csv("data.csv")
+rawData = subset(rawData, !grepl("\\?", boot1000)) # remove unshared nodes
+rawData = rawData[rawData$gb > 0, ]
+rawData$gb = as.numeric(rawData$gb)
+rawData$boot1000 = as.numeric(rawData$boot1000)
+rawData$jack1000 = as.numeric(rawData$jack1000)
+# Box Cox data
+bc <- boxcox(rawData$gb ~ rawData$jack1000)
+lambda <- bc$x[which.max(bc$y)]
+transformedData <- rawData 
+transformedData = transformedData[, c(2,4,10)]
+colnames(transformedData)[colnames(transformedData) == "jack1000"] <- "JK"
+colnames(transformedData)[colnames(transformedData) == "study"] <- "Dataset"
+transformedData$gb <- powerTransform(rawData$gb, lambda) # Apply the Box Cox 
+
+# QRA: Box Cox GB ~ JK
+model = rq(gb ~ JK, data=transformedData, tau=0.5) 
+
+# STRATEGY 1
+# Create some vectors to store the results
+Dataset <- c()
+Overestimated <- c()
+Underestimated <- c()
+Adequate <- c()
+
+# Begin the for loop
+for (name in unique(transformedData$Dataset)) {
+  ## Get data
+  matrix <- transformedData[transformedData$Dataset==name,]
+  JK <- matrix$JK
+  JK <- data.frame(JK) # Create a separate dataframe for each matrix
+  ## Get prediction
+  predictions <- predict.rq(model, newdata = JK, interval="confidence", level = 0.95) 
+  
+  ## Categorize results
+  Cut <- data.frame(predictions)
+  Cut$JK <- matrix$JK
+  Cut$gb <- matrix$gb
+  # If GB is within the CI, the model adequately predicts the observed value 
+  Cut$Cut <- "Adequate"
+  Cut$Cut[Cut$gb >= Cut$lower & Cut$gb <= Cut$higher] <- "Adequate"
+  # If GB is lower than CI, the model overestimates the observed value
+  Cut$Cut[Cut$gb < Cut$lower] <- "Overestimated"
+  # If GB is higher than CI, the model underestimates the observed value
+  Cut$Cut[Cut$gb > Cut$higher] <- "Underestimated"
+  Over = length(Cut$Cut[Cut$Cut == "Overestimated"])
+  Under = length(Cut$Cut[Cut$Cut == "Underestimated"])
+  Total = length(Cut$Cut)
+  Over = (Over/Total)
+  Under = (Under/Total)
+  Okay = 1.0 - (Over + Under)
+  
+  # Append results
+  Dataset <- append(Dataset, name)
+  Overestimated <- append(Overestimated, Over)
+  Underestimated <- append(Underestimated, Under)
+  Adequate <- append(Adequate, Okay)
+}
+
+# Create dataframe
+Results <- data.frame(Dataset, Overestimated, Adequate, Underestimated)
+Results$Dataset <- as.factor(Results$Dataset)
+Factors <- Results[order(Results$Underestimated),]$Dataset
+Melted <- melt(Results, "Dataset")
+Melted$Dataset <- factor(Melted$Dataset, levels=Factors)
+
+# Create plot
+p <- ggplot(Melted, aes(x = Dataset, y = value, fill = variable))
+p <- p + geom_col(colour = "black", position = "fill")
+p <- p + scale_y_continuous(labels = scales::percent)
+p <- p + scale_fill_manual(name="Support estimations\n(confidence intervals of 95%)", values = c("grey70", "white", "grey10"))
+p <- p + theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(), legend.position = c(0.2, 0.8))
+p <- p + labs(x = "Datasets (names are not shown)", y = "Frequency")
+print(p)
+
+# Export image into PDF file
+pdf("fig_CI_strategy1_GB_JK.pdf", width = 8, height = 5.4)
+print(p)
+dev.off()
+```
+
+The overall results of JK are congruent with those of BS. Most clades are overestimated or underestimated using JK as predictor of GB. Now, we can use the second strategy (splitting datasets in training and testing) to estimate the frequency of overestimated and underestimated values of support predicted by JK.
+
+```{r}
+# STRATEGY 2
+
+# Read data
+rawData = read_csv("data.csv")
+rawData = subset(rawData, !grepl("\\?", boot1000)) # remove unshared nodes
+rawData = rawData[rawData$gb > 0, ]
+rawData$gb = as.numeric(rawData$gb)
+rawData$boot1000 = as.numeric(rawData$boot1000)
+rawData$jack1000 = as.numeric(rawData$jack1000)
+# Box Cox data
+bc <- boxcox(rawData$gb ~ rawData$jack1000)
+lambda <- bc$x[which.max(bc$y)]
+rawData$gb <- powerTransform(rawData$gb, lambda)
+set.seed(123)
+training.samples <- rawData$gb %>% # Split the data into training and test
+  createDataPartition(p = 0.8, list = FALSE)
+train.data  <- rawData[training.samples, ]
+test.data <- rawData[-training.samples, ]
+
+# Calculate a quantile regression models for tau=0.5 using the training data
+model50 <- rq(gb ~ jack1000, data=train.data, tau=0.50)
+# Prediction using the testing data
+predictions50 <- predict.rq(model50, newdata=test.data, interval="confidence", level=0.95)
+# Summary for tau=50%
+summary(predictions50)
+# Classify predictions
+Cut$Cut <- "NA"
+Cut$Cut[Cut$gb >= Cut$lower & Cut$gb <= Cut$higher] <- "Adequate"
+Cut$Cut[Cut$gb < Cut$lower] <- "Overestimated"
+Cut$Cut[Cut$gb > Cut$higher] <- "Underestimated"
+
+# Count
+Over = length(Cut$Cut[Cut$Cut == "Overestimated"])
+Under = length(Cut$Cut[Cut$Cut == "Underestimated"])
+Total = length(Cut$Cut)
+cat(paste0("Total = ", Total, ", underestimated = ", Under, ", overestimated = ", Over, "\n"))
+
+# Plot
+p <- ggplot(Cut, aes(x = JK, y = gb)) +
+  geom_ribbon( aes(ymin = lower, ymax = higher), alpha = .25) +
+  geom_point(aes(color = Cut, shape = Cut), size = 2) +
+  geom_line( aes(y = fit), size = 0.5, linetype = "dashed") +
+  scale_colour_manual(values = c("grey", "black", "black")) +
+  scale_shape_manual(values = c(16, 21, 16)) +
+  ggtitle("Quantile regression") +
+  ylab("Box Cox transformation of GB values") +
+  xlab("Raw JK values") +
+  labs(color= "", shape = "") +
+  theme(legend.position = c(0.15, 0.9),
+        axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) 
+p
+# Export image as PDF
+pdf("fig_CI_strategy2_GB_JK.pdf", width = 6, height = 4)
+print(p)
+dev.off()
+```
+
+Again, no matter if we use BS or JK as predictors of GB, resampling metrics seem to underestimate or overestimate support for most nodes in empirical data.
+
+# 5. Nonlinear correlations
+
+As of now, used non-parametric and parametric tests. Among all tests above, In this section, we will estimate nonlinear correlations using (1) the non-uniform piecewise linear correlation, (2) polynomial regressions, (3) spline regressions, (4) generalized additive models, and (5) generalized linear models (GLMs).
+
+## 5.1 Non-uniform piecewise linear correlations
+
+The non-uniform piewise linear correlations were performed with an adaptive local linear correlation computation. This heuristic tool adaptively identify multiple local regions of linear correlations to estimate the overall nonlinear correlation. The estimates will be between 0 and 1 (no negative values). Estimates closer to 1 indicate more nonlinear correlation. 
+
+An important parameter of the nlcor function is called "refine", which is used to refine the granularity of the correlation computation. It varies between 0 and 1. A lower value enforces refinement, but intensifies overfitting. According to the nlcor manual, the refine parameter should be typically less than 0.2.
+
+### 5.1.1 Raw data
+
+```{r}
+# GB ~ BS
+library(nlcor)
+
+# Data
+rawData = read_csv("data.csv")
+rawData = subset(rawData, !grepl("\\?", boot1000)) # remove unshared nodes
+rawData = rawData[rawData$gb > 0, ]
+rawData$gb = as.numeric(rawData$gb)
+rawData$boot1000 = as.numeric(rawData$boot1000)
+rawData$jack1000 = as.numeric(rawData$jack1000)
+X <- rawData[rawData$boot1000>0,]$boot1000
+Y <- rawData[rawData$boot1000>0,]$gb
+
+# Linear Correlation
+lc <- cor(X, Y)
+
+# Nonlinear correlation with refine = 1.0
+c <- nlcor(X, Y, refine = 1.0, plt = T) # refine = 1
+r <- c$cor.estimate
+p <- c$adjusted.p.value
+cat(paste0("Linear correlation = ", lc, "\nNonlinear correlation = ", r, "\nAdjusted P value = ", p))
+
+# Nonlinear correlation with refine = 0.2
+c <- nlcor(X, Y, refine = .2, plt = T) # refine = .2
+r <- c$cor.estimate
+p <- c$adjusted.p.value
+cat(paste0("Linear correlation = ", lc, "\nNonlinear correlation = ", r, "\nAdjusted P value = ", p))
+
+# Nonlinear correlation with refine = 0.01
+c <- nlcor(X, Y, refine = .01, plt = T) # refine = .01
+r <- c$cor.estimate
+p <- c$adjusted.p.value
+cat(paste0("Linear correlation = ", lc, "\nNonlinear correlation = ", r, "\nAdjusted P value = ", p))
+```
+
+As noted, the nlcor with refinement of 1.0 and 0.2 are similar, with some slives with different slopes at 0.2. This pattern is more pronounced at 0.01, which could indicate overfitting. 
+
+We will test if the same pattern is visible for GB ~ JK.
+
+```{r}
+# GB ~ JK
+library(nlcor)
+
+# Data
+rawData = read_csv("data.csv")
+rawData = subset(rawData, !grepl("\\?", jack1000)) # remove unshared nodes
+rawData = rawData[rawData$gb > 0, ]
+rawData$gb = as.numeric(rawData$gb)
+rawData$boot1000 = as.numeric(rawData$boot1000)
+rawData$jack1000 = as.numeric(rawData$jack1000)
+X <- rawData[rawData$jack1000>0,]$jack1000
+Y <- rawData[rawData$jack1000>0,]$gb
+
+# Linear Correlation
+lc <- cor(X, Y)
+
+# Nonlinear correlation with refine = 1.0
+c <- nlcor(X, Y, refine = 1.0, plt = T) # refine = 1
+r <- c$cor.estimate
+p <- c$adjusted.p.value
+cat(paste0("Linear correlation = ", lc, "\nNonlinear correlation = ", r, "\nAdjusted P value = ", p))
+
+# Nonlinear correlation with refine = 0.2
+c <- nlcor(X, Y, refine = .2, plt = T) # refine = .2
+r <- c$cor.estimate
+p <- c$adjusted.p.value
+cat(paste0("Linear correlation = ", lc, "\nNonlinear correlation = ", r, "\nAdjusted P value = ", p))
+
+# Nonlinear correlation with refine = 0.01
+c <- nlcor(X, Y, refine = .01, plt = T) # refine = .01
+r <- c$cor.estimate
+p <- c$adjusted.p.value
+cat(paste0("Linear correlation = ", lc, "\nNonlinear correlation = ", r, "\nAdjusted P value = ", p))
+```
+
+As we can see, the nlcor analyses considering JK as predictor of GB is similar to those considering BS as predictor of GB.
+
+### 5.1.2 Box Cox transformations
+
+We will test if the same pattern is hold when analyzing Box Cox transformed GB with the nlcor.
+
+```{r}
+library(nlcor)
+
+# Define function
+powerTransform <- function(y, lambda1, lambda2 = NULL, method = "boxcox") {
+  boxcoxTrans <- function(x, lam1, lam2 = NULL) {
+    # if we set lambda2 to zero, it becomes the one parameter transformation
+    lam2 <- ifelse(is.null(lam2), 0, lam2)
+
+    if (lam1 == 0L) {
+      log(y + lam2)
+    } else {
+      (((y + lam2)^lam1) - 1) / lam1
+    }
+  }
+  switch(method
+         , boxcox = boxcoxTrans(y, lambda1, lambda2)
+         , tukey = y^lambda1
+  )
+}
+
+# Data
+rawData = read_csv("data.csv")
+rawData = subset(rawData, !grepl("\\?", boot1000))
+rawData = rawData[rawData$gb > 0, ]
+rawData$gb = as.numeric(rawData$gb)
+rawData$boot1000 = as.numeric(rawData$boot1000)
+rawData$jack1000 = as.numeric(rawData$jack1000)
+X <- rawData[rawData$boot1000>0,]$boot1000
+Y <- rawData[rawData$boot1000>0,]$gb
+
+# Box Cox transformation
+bc <- boxcox(Y ~ X)
+lambda <- bc$x[which.max(bc$y)]
+Y <- powerTransform(Y, lambda)
+
+# Calculate the nonlinear correlation
+c <- nlcor(X, Y, refine = 0.2, plt = T)
+r <- c$cor.estimate
+p <- c$adjusted.p.value
+
+# Calculate the linear correlation (for comparison)
+lc <- cor(X, Y)
+
+# Report
+cat(paste0("Linear correlation = ", lc, "\nNonlinear correlation = ", r, "\nAdjusted P value = ", p))
+```
+
+```{r}
+library(nlcor)
+
+# Define function
+powerTransform <- function(y, lambda1, lambda2 = NULL, method = "boxcox") {
+  boxcoxTrans <- function(x, lam1, lam2 = NULL) {
+    # if we set lambda2 to zero, it becomes the one parameter transformation
+    lam2 <- ifelse(is.null(lam2), 0, lam2)
+
+    if (lam1 == 0L) {
+      log(y + lam2)
+    } else {
+      (((y + lam2)^lam1) - 1) / lam1
+    }
+  }
+  switch(method
+         , boxcox = boxcoxTrans(y, lambda1, lambda2)
+         , tukey = y^lambda1
+  )
+}
+
+# Data
+rawData = read_csv("data.csv")
+rawData = subset(rawData, !grepl("\\?", jack1000))
+rawData = rawData[rawData$gb > 0, ]
+rawData$gb = as.numeric(rawData$gb)
+rawData$boot1000 = as.numeric(rawData$boot1000)
+rawData$jack1000 = as.numeric(rawData$jack1000)
+X <- rawData[rawData$jack1000>0,]$jack1000
+Y <- rawData[rawData$jack1000>0,]$gb
+
+# Box Cox transformation
+bc <- boxcox(Y ~ X)
+lambda <- bc$x[which.max(bc$y)]
+Y <- powerTransform(Y, lambda)
+
+# Calculate the nonlinear correlation
+c <- nlcor(X, Y, refine = 0.2, plt = T)
+r <- c$cor.estimate
+p <- c$adjusted.p.value
+
+# Calculate the linear correlation (for comparison)
+lc <- cor(X, Y)
+
+# Report
+cat(paste0("Linear correlation = ", lc, "\nNonlinear correlation = ", r, "\nAdjusted P value = ", p))
+```
+
+Our nlcor analyses using Box Cox transformed values of GB indicates a high nonlinear estimate. However, corroborating Machado et al. (2022), the estimates using nonlinear and linear correlations are identical, indicating that the nonlinear model is not improving the fit of the data.
+
+## 5.2 Polynomial regressions (CHECK P-VALUES FOR THE FINAL DATASET!!!)
+
+Polynomial regressions adds polynomial terms to a model. For instance, a linear model includes a 1st polynomial degree (Y = β0 + β1X), a quadratic model includes a 2nd degree (Y = β0 + β1X + β2$X^2$), a cubic model includes a 3rd degree  (Y = β0 + β1X + β2$X^2$ +  β3$X^3$), and so on. 
+
+```{r}
+# GB ~ poly BS
+
+# Data
+rawData = read_csv("data.csv")
+rawData = subset(rawData, !grepl("\\?", boot1000)) # remove unshared nodes
+rawData = rawData[rawData$gb > 0, ]
+rawData$gb = as.numeric(rawData$gb)
+rawData$boot1000 = as.numeric(rawData$boot1000)
+rawData$jack1000 = as.numeric(rawData$jack1000)
+
+# Split the data into training and test set
+set.seed(123)
+training.samples <- rawData$gb %>%
+  createDataPartition(p = 0.8, list = FALSE)
+train.data  <- rawData[training.samples, ]
+test.data <- rawData[-training.samples, ]
+
+# Visualize the scatter plot of the BS vs GB variables in the training set
+ggplot(train.data, aes(boot1000, gb) ) +
+  geom_point() +
+  stat_smooth()
+
+# Polynomial regression
+lm(gb ~ poly(boot1000, 20, raw = TRUE), data = train.data) %>% summary()
+```
+
+As indicated in the output above, polynomial terms beyond the 11th may results in non-applicables. Thus, we will create a 11th polynomial regression:
+
+```{r}
+# GB ~ poly BS 11th
+
+# Polynomial regression
+model = lm(gb ~ poly(boot1000, 11, raw = TRUE), data = train.data) 
+summary(model)
+
+# Make predictions
+predictions <- model %>% predict(test.data)
+# Model performance
+data.frame(
+  RMSE = RMSE(predictions, test.data$gb),
+  R2 = R2(predictions, test.data$gb)
+)
+
+# Visualize rge 12th polynomial regression:
+ggplot(train.data, aes(boot1000, gb) ) +
+  geom_point() +
+  stat_smooth(method = lm, formula = y ~ poly(x, 11, raw = TRUE))
+```
+
+Among the models, although the RMSE and the $R^2$ of the 11th polynomial regression are the lowest and the highest, respectively, the p-value is not significant, indicating that BS and GB are not correlated.
+
+```{r}
+# GB ~ poly JK 11th
+
+# Polynomial regression
+model = lm(gb ~ poly(jack1000, 11, raw = TRUE), data = train.data) 
+summary(model)
+
+# Make predictions
+predictions <- model %>% predict(test.data)
+# Model performance
+data.frame(
+  RMSE = RMSE(predictions, test.data$gb),
+  R2 = R2(predictions, test.data$gb)
+)
+
+# Visualize rge 12th polynomial regression:
+ggplot(train.data, aes(jack1000, gb) ) +
+  geom_point() +
+  stat_smooth(method = lm, formula = y ~ poly(x, 11, raw = TRUE))
+```
+
+Overall, the polynomial regressions using JK as predictor of GB reveals the same results as those for BS and GB.
+
+## 5.3 Spline regressions
+
+Spline regression is a statistical modeling technique used to capture nonlinear relationships between a dependent variable and one or more independent variables. A spline is a continuous piecewise polynomial function that is defined over a series of segments or intervals. Each segment is typically defined by a set of knots or breakpoints, where the polynomial function can change. We placed the knots at the same array of values used by Machado et al. (2022).
+
+```{r}
+# Spline regression: GB ~ BS
+
+# Place the knots at the lower quartile, the median quartile, and the upper quartile
+knots <- quantile(train.data$lstat, p = c(0.25, 0.5, 0.75))
+
+# We’ll create a model using a cubic spline (degree = 3)
+model <- lm (gb ~ bs(boot1000, knots = knots), data = train.data)
+predictions <- model %>% predict(test.data)
+
+# Model performance
+data.frame(
+  RMSE = RMSE(predictions, test.data$gb),
+  R2 = R2(predictions, test.data$gb)
+)
+
+# Visualize the cubic spline
+ggplot(train.data, aes(boot1000, gb) ) +
+  geom_point() +
+  stat_smooth(method = lm, formula = y ~ splines::bs(x, df = 3))
+```
+
+For BS, the RMSE and the $R^2$ of the polynomial regression were, respectively, XX and XX. The spline regression, however, resulted in a [higher or lower???????] RMSE (XXX) and [higher or lower???????] $R^2$ (XX).
+
+We can now perform the spline regresssions considering JK as predictor of GB.
+
+```{r}
+# Spline regression: GB ~ JK
+
+# Place the knots at the lower quartile, the median quartile, and the upper quartile
+knots <- quantile(train.data$lstat, p = c(0.25, 0.5, 0.75))
+
+# We’ll create a model using a cubic spline (degree = 3)
+model <- lm (gb ~ bs(jack1000, knots = knots), data = train.data)
+predictions <- model %>% predict(test.data)
+
+# Model performance
+data.frame(
+  RMSE = RMSE(predictions, test.data$gb),
+  R2 = R2(predictions, test.data$gb)
+)
+
+# Visualize the cubic spline
+ggplot(train.data, aes(jack1000, gb) ) +
+  geom_point() +
+  stat_smooth(method = lm, formula = y ~ splines::bs(x, df = 3))
+```
+
+## 5.4 Generalized additive models (GAMs)
+
+A caveat of spline regressions is the arbitrary specification of knots. As a solution, Generalized additive models (GAM) can automatically fit a spline regression.
+
+```{r}
+# GAM: GB ~ BS
+
+# Build the model"the term s(BS) tells the gam() function to find the "best"" knots for a spline term
+model <- gam(gb ~ s(boot1000), data = train.data)
+# Make predictions
+predictions <- model %>% predict(test.data)
+# Model performance
+data.frame(
+  RMSE = RMSE(predictions, test.data$gb),
+  R2 = R2(predictions, test.data$gb)
+)
+
+# Visualize the data
+ggplot(train.data, aes(boot1000, gb) ) +
+  geom_point() +
+  stat_smooth(method = gam, formula = y ~ s(x))
+```
+
+Write if the results of GAMs are better than polynomial and spline regressions.!!!!!!!!!!!!!!
+
+```{r}
+# GAM: GB ~ JK
+
+# Build the model"the term s(BS) tells the gam() function to find the "best"" knots for a spline term
+model <- gam(gb ~ s(jack1000), data = train.data)
+# Make predictions
+predictions <- model %>% predict(test.data)
+# Model performance
+data.frame(
+  RMSE = RMSE(predictions, test.data$gb),
+  R2 = R2(predictions, test.data$gb)
+)
+
+# Visualize the data
+ggplot(train.data, aes(jack1000, gb) ) +
+  geom_point() +
+  stat_smooth(method = gam, formula = y ~ s(x))
+```
+
+## 5.5 Generalized Linear Models (GLMs)
+
+Because GB is not a continuous variable with normal distribution, linear models are not suitable. Besides quantile regressions, we can also test GLMs using Poisson, Quasipoisson or Negative Binomial distributions. All of them are suitable for count variables such as GB. However, we need to perform all of them and compare the best fitting model using AIC and residual deviance values.
+
+```{r}
+# GB ~ BS
+rawData = read_csv("data.csv")
+rawData = subset(rawData, !grepl("\\?", boot1000)) # remove unshared nodes
+rawData = rawData[rawData$gb >= 0, ]
+rawData = rawData[rawData$gb <= 256, ]
+rawData$gb = as.numeric(rawData$gb)
+rawData$boot1000 = as.numeric(rawData$boot1000)
+rawData$jack1000 = as.numeric(rawData$jack1000)
+
+# GLM with Poisson distribution
+model1 = glm(gb ~ boot1000, data = rawData, family = poisson(link = "log"))
+summary(model1)
+#plot(model1)
+
+# GLM with quasipoisson distribution
+model2 <- glm(gb ~ boot1000, family = quasipoisson(link = "log"), data = rawData)
+summary(model2)
+#plot(model2)
+
+# GLM with negative binomial distribution
+model3 = glm.nb(gb ~ boot1000, data = rawData, link = log)
+summary(model3)
+#plot(model3)
+
+# Model selection
+c("Poisson", "Quasipoisson", "NB")
+c(AIC(model1), AIC(model2), AIC(model3))
+c(deviance(model1), deviance(model2), deviance(model3))
+
+# Make predictions for GLM NB
+predictions <- model3 %>% predict(rawData)
+R2 = pR2(model3, rawData$gb)
+# Model performance for GLM NB
+#data.frame(
+#  RMSE = RMSE(predictions, rawData$gb),
+#  R2[4]
+#)
+
+# Plot NB GLM
+ggplot(data = rawData, aes(x = boot1000, y = gb)) +
+  geom_point() +  
+  geom_smooth(method = "glm.nb", formula = y ~ x, color = "red", se = F) + 
+  labs(x = "BS", y = "GB", title = "Observed X vs. Observed Y with Tendency Line from GLM.NB") +
+  ylim(-0.5, 90)  +
+    theme(
+    panel.background = element_blank(),
+    plot.background = element_blank()
+  )
+```
+
+```{r}
+# GB ~ JK
+rawData = read_csv("data.csv")
+rawData = subset(rawData, !grepl("\\?", boot1000)) # remove unshared nodes
+rawData = rawData[rawData$gb >= 0, ]
+rawData = rawData[rawData$gb <= 256, ]
+rawData$gb = as.numeric(rawData$gb)
+rawData$boot1000 = as.numeric(rawData$boot1000)
+rawData$jack1000 = as.numeric(rawData$jack1000)
+
+# GLM with Poisson distribution
+model1 = glm(gb ~ jack1000, data = rawData, family = poisson(link = "log"))
+summary(model1)
+plot(model1)
+
+# GLM with quasipoisson distribution
+model2 <- glm(gb ~ jack1000, family = quasipoisson(link = "log"), data = rawData)
+summary(model2)
+plot(model2)
+
+# GLM with negative binomial distribution
+model3 = glm.nb(gb ~ jack1000, data = rawData)
+summary(model3)
+plot(model3)
+
+# Model selection
+c("Poisson", "Quasipoisson", "NB")
+c(AIC(model1), AIC(model2), AIC(model3))
+c(deviance(model1), deviance(model2), deviance(model3))
+
+# Make predictions for GLM NB
+predictions <- model3 %>% predict(rawData)
+R2 = pR2(model3, rawData$gb)
+# Model performance for GLM NB
+data.frame(
+  RMSE = RMSE(predictions, rawData$gb),
+  R2[4]
+)
+
+# Plot NB GLM
+ggplot(data = rawData, aes(x = jack1000, y = gb)) +
+  geom_point() +  
+  geom_smooth(method = "glm.nb", formula = y ~ x, color = "red", se = F) + 
+  labs(x = "JK", y = "GB", title = "Observed X vs. Observed Y with Tendency Line from GLM.NB") +
+  ylim(-0.5, 90)  +
+    theme(
+    panel.background = element_blank(),
+    plot.background = element_blank()
+  )
+```
+
+
+The GLM with Negative Binomial distribution fits better than Poisson and Quasipoisson, as revealed by the AIC (GLM with NB has the lowest AIC) and the relation between residual deviance and number of degrees of freedom (GLM with NB has the residual deviance closer to # degrees of freedom compared to Poisson and quasipoisson models). Thus, we will use the NB to estimate the % of overestimated and underestimated values.
+
+## 5.6 Overestimation and underestimation
+
+We performed five different nonlinear models so far. First, we demonstrated that the non-uniform piecewise linear correlations did not improved linear correlations. Second, we also performed: 
+
+- 12th polynomial regressions (BS: RMSE = 24.97; $R^2$ = 0.24; JK = RMSE = 25.37; $R^2$ = 0.22)
+
+- Spline regressions (BS: RMSE = 14.87; $R^2$ = 0.18; JK: RMSE = 14.89; $R^2$ = 0.17)
+
+- GAMs (BS: RMSE = 14.68; $R^2$ = 0.21; JK: RMSE = 14.69; $R^2$ = 0.20), 
+
+- GLMs with NB (BS: RMSE = 14.68; $R^2$ = 0.21; JK: RMSE = 14.69; $R^2$ = 0.20). 
+
+We will now estimate overestimate and underestimation for the 12th polynomial regressions, which were the models with the highest $R^2$ among the nonlinear models. We will split the data between training (80%) and testing datasets, as commonly performed in Machine Learning. 
+
+The training dataset will be used to estimate the model. The testing dataset will be used to predict GB values based on the trained model and also empirical BS and JK values, and also estimate 95% confidence intervals (CI). If the empirical GB values of the training dataset are within the 95% CI, we considered the predicted GB values adequate; if the empirical GB values are below the lower CI, the predicted GB values are overestimated; and if the empirical GB values are above the higher CI, the predicted GB values are underestimated.
+
+```{r}
+# Over- and Underestimation: GB ~ BS
+
+# Data
+rawData = read_csv("data.csv")
+rawData = subset(rawData, !grepl("\\?", boot1000)) # remove unshared nodes
+rawData = rawData[rawData$gb >= 0, ]
+rawData$gb = as.numeric(rawData$gb)
+rawData$boot1000 = as.numeric(rawData$boot1000)
+rawData$jack1000 = as.numeric(rawData$jack1000)
+
+# Split the data into training and test set
+set.seed(123)
+training.samples <- rawData$gb %>%
+  createDataPartition(p = 0.8, list = FALSE)
+train.data  <- rawData[training.samples, ]
+test.data <- rawData[-training.samples, ]
+
+# 11th Polynomial regression
+model = lm(gb ~ poly(boot1000, 11, raw = TRUE), data = train.data) 
+summary(model)
+
+# Make predictions about the test dataset
+myPredict <- predict(model, newdata = test.data, interval="predict", level = 0.95)
+myConfidence <- predict(model, newdata = test.data, interval="confidence", level = 0.95)
+colnames(myConfidence) <- c("FIT", "LWR", "UPR")
+Cut <- cbind(test.data, myPredict, myConfidence)
+
+# Classify predictions
+Cut$Cut <- "NA"
+Cut$Cut[Cut$gb >= Cut$LWR & Cut$gb <= Cut$UPR] <- "Adequate"
+Cut$Cut[Cut$gb < Cut$LWR] <- "Overestimated"
+Cut$Cut[Cut$gb > Cut$UPR] <- "Underestimated"
+
+# Count
+Over = length(Cut$Cut[Cut$Cut == "Overestimated"])
+Under = length(Cut$Cut[Cut$Cut == "Underestimated"])
+Total = length(Cut$Cut)
+cat(paste0("Total = ", Total, ", underestimated = ", Under, ", overestimated = ", Over, "\n"))
+
+# Plot
+p <- ggplot(Cut, aes(x = boot1000, y = gb)) +
+  geom_ribbon( aes(ymin = lwr, ymax = upr), alpha = .05) +
+  geom_ribbon( aes(ymin = LWR, ymax = UPR), alpha = .25) +
+  geom_point(aes(color = Cut, shape = Cut), size = 2) +
+  geom_line( aes(y = fit), size = 0.5) +
+  scale_colour_manual(values = c("grey", "black", "black")) +
+  scale_shape_manual(values = c(16, 21, 16)) +
+  ggtitle("Polynomial regression") +
+  ylab("Raw GB values") +
+  xlab("Raw BS values") +
+  labs(color= "", shape = "") +
+  theme(legend.position = c(0.15, 0.9))
+p
+```
+
+```{r}
+# Over- and Underestimation: GB ~ JK
+
+# Data
+rawData = read_csv("data.csv")
+rawData = subset(rawData, !grepl("\\?", boot1000)) # remove unshared nodes
+rawData = rawData[rawData$gb >= 0, ]
+rawData$gb = as.numeric(rawData$gb)
+rawData$boot1000 = as.numeric(rawData$boot1000)
+rawData$jack1000 = as.numeric(rawData$jack1000)
+
+# Split the data into training and test set
+set.seed(123)
+training.samples <- rawData$gb %>%
+  createDataPartition(p = 0.8, list = FALSE)
+train.data  <- rawData[training.samples, ]
+test.data <- rawData[-training.samples, ]
+
+# 11th Polynomial regression
+model = lm(gb ~ poly(jack1000, 11, raw = TRUE), data = train.data) 
+summary(model)
+
+# Make predictions about the test dataset
+myPredict <- predict(model, newdata = test.data, interval="predict", level = 0.95)
+myConfidence <- predict(model, newdata = test.data, interval="confidence", level = 0.95)
+colnames(myConfidence) <- c("FIT", "LWR", "UPR")
+Cut <- cbind(test.data, myPredict, myConfidence)
+
+# Classify predictions
+Cut$Cut <- "NA"
+Cut$Cut[Cut$gb >= Cut$LWR & Cut$gb <= Cut$UPR] <- "Adequate"
+Cut$Cut[Cut$gb < Cut$LWR] <- "Overestimated"
+Cut$Cut[Cut$gb > Cut$UPR] <- "Underestimated"
+
+# Count
+Over = length(Cut$Cut[Cut$Cut == "Overestimated"])
+Under = length(Cut$Cut[Cut$Cut == "Underestimated"])
+Total = length(Cut$Cut)
+cat(paste0("Total = ", Total, ", underestimated = ", Under, ", overestimated = ", Over, "\n"))
+
+# Plot
+p <- ggplot(Cut, aes(x = jack1000, y = gb)) +
+  geom_ribbon( aes(ymin = lwr, ymax = upr), alpha = .05) +
+  geom_ribbon( aes(ymin = LWR, ymax = UPR), alpha = .25) +
+  geom_point(aes(color = Cut, shape = Cut), size = 2) +
+  geom_line( aes(y = fit), size = 0.5) +
+  scale_colour_manual(values = c("grey", "black", "black")) +
+  scale_shape_manual(values = c(16, 21, 16)) +
+  ggtitle("Polynomial regression") +
+  ylab("Raw GB values") +
+  xlab("Raw JK values") +
+  labs(color= "", shape = "") +
+  theme(legend.position = c(0.15, 0.9))
+p
+```
+
+
+# 6. Conclusion
+# 7. References
+
+Grant, T., & Kluge, A. G. (2008). Clade support measures and their adequacy. Cladistics, 24(6), 1051-1064.
+
+Machado, D.J., Marques, F.P.L., Jiménez‐Ferbans, L. & Grant, T. (2022). An empirical test of the relationship between the bootstrap and likelihood ratio support in maximum likelihood phylogenetic analysis. Cladistics, 38(3), 392-401.
+
+Meyer, P. E. (2008). Information-Theoretic Variable Selection and Network Inference from Microarray Data. PhD thesis of the Universite Libre de Bruxelles.
+
+Nuzzo, R. (2014). Statistical errors: P values, the'gold standard'of statistical validity, are not as reliable as many scientists assume. Nature, 506(7487), 150-153.
+
+Wang, Y., Li, Y., Cao, H., Xiong, M., Shugart, Y.Y. & Jin, L. (2015) Efficient test for nonlinear dependence of two continuous variables. BMC Bioinformatics, 16(1), 1–8.
